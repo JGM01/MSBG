@@ -288,7 +288,12 @@ void bench_laplacian_smoothing_e2e() {
 }
 
 int main(int argc, char **argv) {
-    if (argc > 1 && std::string(argv[1]) == "small") gSmall = true;
+    std::string scenario;
+    for (int i = 1; i < argc; i++) {
+        std::string a = argv[i];
+        if (a == "small") gSmall = true;
+        else scenario = a;
+    }
     const char *env = getenv("MSBG_BENCH_SCALE");
     if (env && std::string(env) == "small") gSmall = true;
 
@@ -304,13 +309,22 @@ int main(int argc, char **argv) {
     ThrSetMaxNumberOfTBBThreads(nMaxThreads);
     nMaxThreads = std::max(1, std::min(nMaxThreadsAct, nMaxThreads));
 
+    bool all = scenario.empty();
+    bool known = scenario == "hot" || scenario == "contention" ||
+                 scenario == "cold" || scenario == "halo" || scenario == "laplacian";
+    if (!all && !known) {
+        std::cerr << "unknown scenario '" << scenario
+                  << "' (use: hot contention cold halo laplacian)\n";
+        return 1;
+    }
+
     std::cout << "Starting C++ MSBG Benchmarks (real kernels)...\n\n";
 
-    bench_hot_path_scaling();
-    bench_multithreaded_contention();
-    bench_cold_extension();
-    bench_halo_gather();
-    bench_laplacian_smoothing_e2e();
+    if (all || scenario == "hot")        bench_hot_path_scaling();
+    if (all || scenario == "contention") bench_multithreaded_contention();
+    if (all || scenario == "cold")       bench_cold_extension();
+    if (all || scenario == "halo")       bench_halo_gather();
+    if (all || scenario == "laplacian")  bench_laplacian_smoothing_e2e();
 
     return 0;
 }

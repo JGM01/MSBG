@@ -24,8 +24,15 @@ nix-shell
 ```
 
 `shell.nix` provides `gcc`, `gnumake`, `ispc`, `llvmPackages.openmp`, `tbb`,
-`libpng`, `libjpeg`, `zlib` (deliberately **no** `glibc` — see §2). Its
+`libpng`, `libjpeg`, `zlib`, `gh` (deliberately **no** `glibc` — see §2). Its
 `shellHook` sets `NIX_ENFORCE_NO_NATIVE=0` (required for `-march=native`).
+
+**Platform: Linux x86-64 only.** The C++ sources are x86-only — `external/vectorclass`
+is a header-only SIMD library built on x86 intrinsics (`__m128`/`__m256`/`__m512`),
+and the build assumes `-m64 -DMI_WITH_64BIT -DMIMP_ON_LINUX` plus `-march=native`.
+It does **not** build or run on macOS, especially Apple Silicon (arm64). The Rust
+port (`../msbg-rs`) has no such restriction and runs on macOS arm64 via
+`portable_simd`.
 
 ## 2. IMPORTANT: keep `glibc` OUT of shell.nix
 
@@ -177,3 +184,7 @@ built without ISPC. The ISPC functions (`ispc_laplacian_smooth_halo_block`,
   `heaptrack` — see `.agents/skills/debugging/SKILL.md` for what each is for and
   example invocations (including instruction-peeping comparisons vs the Rust
   port).
+- `./profile.sh <hot|contention|cold|halo|laplacian>` profiles one scenario and
+  writes `build/profile.txt` (flat top-N self-time) + `build/flamegraph.svg`.
+  See `.agents/skills/compare-cpp-rust/SKILL.md` for the Rust side and the
+  side-by-side comparison flow.

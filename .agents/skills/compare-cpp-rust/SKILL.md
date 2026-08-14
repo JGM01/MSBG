@@ -1,6 +1,6 @@
 ---
 name: compare-cpp-rust
-description: Compare this C++ MSBG implementation against the Rust port (../msbg-rs) — IPC/cache performance and code size. Use when asked whether the Rust refactor is faster or cleaner than C++, or why their numbers differ.
+description: Compare this C++ MSBG implementation against the Rust port (../msbg-rs) — IPC/cache performance, code size, and flamegraph-style profiles. Use when asked whether the Rust refactor is faster or cleaner than C++, or why their numbers differ.
 ---
 
 # Compare C++ MSBG vs Rust msbg-rs
@@ -78,6 +78,38 @@ Merge into one table and compute:
 Record both layouts only to *document* the divergence; don't reconcile them. The
 Rust side is the target: it should be superior, or equivalent where superiority
 isn't applicable.
+
+## Profile comparison (flamegraph-style)
+
+For a *where-does-time-go* view, profile one scenario on each side and compare
+the top self-time functions. Each repo has a script that emits a machine-readable
+`profile.txt` (flat `perf report` top-N, filtered to ≥2% self time) plus an SVG:
+
+```bash
+# C++  (in the MSBG shell)
+./profile.sh laplacian                # -> build/profile.txt + build/flamegraph.svg
+
+# Rust (in the msbg-rs shell, Linux)
+./profile-linux.sh laplacian_smoothing_e2e   # -> target/profile/profile.txt + flamegraph.svg
+```
+
+Scenario-name mapping (same algorithm on both sides):
+
+| C++ arg | Rust bench group |
+|---|---|
+| `hot` | `blockpool_hot_path` |
+| `contention` | `blockpool_contention` |
+| `cold` | `blockpool_cold_alloc` |
+| `halo` | `halo_gather` |
+| `laplacian` | `laplacian_smoothing_e2e` |
+
+Rust-only benches with no C++ counterpart: `laplacian_compute_only`, `voxel_access`.
+
+How to read: present the two `profile.txt` top-N lists side by side and look at
+*where* self-time goes — the same kernel dominating both sides, or a cost that
+appears on only one side (e.g. a libm `fmaf` call on the Rust side, a heavier
+multires halo on the C++ side). The SVG is for humans; `profile.txt` is the
+agent-ingestible artifact.
 
 ## Gotchas
 

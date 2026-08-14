@@ -11,6 +11,10 @@ pkgs.mkShell {
     libpng
     libjpeg
     zlib
+    # git / github (fork/push)
+    gh
+    # profiling (profile.sh -> perf report top-N + flamegraph svg)
+    inferno
     # debugging
     gdb
     strace
