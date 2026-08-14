@@ -17,9 +17,7 @@ scratch.txt
 *.bak
 rs 
 sv
-build*
-build*/
-build*/*
+build/
 bin/*
 
 # Prerequisites

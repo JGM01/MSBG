@@ -1,9 +1,9 @@
 /******************************************************************************
  *
- * Copyright 2025 Bernhard Braun 
+ * Copyright 2025 Bernhard Braun
  *
  * This program is free software, distributed under the terms of the
- * Apache License, Version 2.0 
+ * Apache License, Version 2.0
  * http://www.apache.org/licenses/LICENSE-2.0
  *
  ******************************************************************************/
@@ -27,11 +27,11 @@
 #include "blockpool.h"
 
 #if 0
-// 
+//
 // Must declare InterlockedPushListSList manually here
 // See: http://stackoverflow.com/questions/11980721/interlockedpushlistslist-is-missing-where-is-it
 //
-extern "C" 
+extern "C"
 {
   PSLIST_ENTRY  FASTCALL InterlockedPushListSList(
       PSLIST_HEADER ListHead,
@@ -42,12 +42,24 @@ extern "C"
 }
 #endif
 
+void BlockPool::reset() {
+#ifdef BLOCKPOOL_FAST_MONOTONIC
+    // Resets the bump allocator index back to the beginning of the first chunk
+    _bp_next_free.store(0, std::memory_order_relaxed);
+#else
+    // If fast monotonic mode is disabled, a true O(1) reset isn't supported
+    // without abandoning the existing free-list state.
+    fprintf(stderr, "O(1) reset requires BLOCKPOOL_FAST_MONOTONIC\n");
+    exit(1);
+#endif
+}
+
 /*-------------------------------------------------------------------------*/
 /* 									   */
 /*-------------------------------------------------------------------------*/
-int BlockPool::extend_( int iExtend, void **pBlockOut, int nBlocksIn, 
+int BlockPool::extend_( int iExtend, void **pBlockOut, int nBlocksIn,
     		       bool doPushToFreelist,
-		       int *pIdxExtOut )  
+		       int *pIdxExtOut )
 {
   int rcThis=0;
   void *chunkOfBlocks=NULL,
@@ -87,7 +99,7 @@ int BlockPool::extend_( int iExtend, void **pBlockOut, int nBlocksIn,
   szChunkPad = MAX(_blockAlign,(CPU_SIMD_WIDTH));
   szChunkPad = ALIGN(szChunkPad,_blockAlign);
 
-  szNeeded = _blockSize*nBlocks + 2*szChunkPad; 
+  szNeeded = _blockSize*nBlocks + 2*szChunkPad;
 
   _szChunkPad = szChunkPad;
 
@@ -106,12 +118,12 @@ int BlockPool::extend_( int iExtend, void **pBlockOut, int nBlocksIn,
 	_name,
 	(double)szNeeded/(double)ONE_MB,
 	(double)_totalSize/(double)ONE_MB,
-	memResource, 
+	memResource,
 	getNumBlocksAllocated(),_nBlocksMax
 	));
 #endif
 
-  // 
+  //
   // Allocate new chunk of blocks
   //
   {
@@ -122,7 +134,7 @@ int BlockPool::extend_( int iExtend, void **pBlockOut, int nBlocksIn,
       {
         ALLOCMEM_LARGE_ALIGNED_(chunkOfBlocks0, void, szNeeded, _blockAlign, 1, puid );
       }
-    }		       
+    }
   }
   if(!chunkOfBlocks0)
   {
@@ -136,7 +148,7 @@ int BlockPool::extend_( int iExtend, void **pBlockOut, int nBlocksIn,
   memset(BYTE_OFFSET(chunkOfBlocks0,szNeeded-szChunkPad),0,szChunkPad);
 
   UT_ASSERT(_extends[iExtend]==NULL);
-  
+
   _extends[iExtend] = chunkOfBlocks0;
 
   ExtendInfo ei;
@@ -161,7 +173,7 @@ int BlockPool::extend_( int iExtend, void **pBlockOut, int nBlocksIn,
     // assemble local temp. list first
     SLIST_HEADER tmpList
 		 __attribute__((aligned(SBG_BLOCK_ALIGN)));
-    
+
     SLIST_ENTRY *firstEntry=NULL,
 		*lastEntry=NULL;
 
@@ -176,21 +188,21 @@ int BlockPool::extend_( int iExtend, void **pBlockOut, int nBlocksIn,
       iBlock0++;
       nBlocks--;
     }
-    
+
     // Build local temp. list of new blocks
-    for(int i=0;i<nBlocks;i++) 
+    for(int i=0;i<nBlocks;i++)
     {
       // push in reverse order (to be later pop'ed in original order)
-      SLIST_ENTRY *entry = 
-	(SLIST_ENTRY*)BYTE_OFFSET(chunkOfBlocks, 
-				  _blockSize*(nBlocks-1-i+iBlock0) 
+      SLIST_ENTRY *entry =
+	(SLIST_ENTRY*)BYTE_OFFSET(chunkOfBlocks,
+				  _blockSize*(nBlocks-1-i+iBlock0)
 				  + sizeof(SLIST_ENTRY)  );
 
       InterlockedPushEntrySList( &tmpList, entry );
 
       if(i==0) lastEntry = entry;
       if(i==nBlocks-1) firstEntry = entry;
-      TRC3((" push block %p to temp.\n",i,entry)); 
+      TRC3((" push block %p to temp.\n",i,entry));
     }
     TRC3(("tmp_list: first=%p last=%p\n",firstEntry,lastEntry));
 
@@ -199,7 +211,7 @@ int BlockPool::extend_( int iExtend, void **pBlockOut, int nBlocksIn,
     {
       TRCL(trcLevel,(" '%s': Push temp list of %d blocks to freelist\n",
 	    _name, nBlocks));
-      InterlockedPushListSList( &_freelist, 
+      InterlockedPushListSList( &_freelist,
  	                         firstEntry, lastEntry, nBlocks );
     }
 
@@ -215,8 +227,8 @@ int BlockPool::extend_( int iExtend, void **pBlockOut, int nBlocksIn,
   }
   #endif
 
-  // 
-  // Apply extension size policy 
+  //
+  // Apply extension size policy
   //
 #if 0
   _nBlocksExtend = MIN( 1.414*_nBlocksExtend,
@@ -239,7 +251,7 @@ void *BlockPool::allocBlock( int bid )
   void *block = NULL;
 
   #ifdef BLOCKPOOL_FAST_MONOTONIC
-  
+
   {
     int iBlock = _bp_next_free++;
     UT_ASSERT0(iBlock<_nBlocksMax);
@@ -251,7 +263,7 @@ void *BlockPool::allocBlock( int bid )
     {
       TRCERR(("BlockPool '%s': Number of extends %d exceeds maximum %d.\n",
 	  _name,iSeg+1,ARRAY_LENGTH(_extends)));
-      UT_ASSERT_FATAL(FALSE);  
+      UT_ASSERT_FATAL(FALSE);
     }
 
     UT_ASSERT2( iBlockInSeg>=0 && iBlockInSeg < _bp_blocks_per_seg );
@@ -267,11 +279,11 @@ void *BlockPool::allocBlock( int bid )
 
       // re-check if not already extended by other threads
       seg = _extends[iSeg].load(std::memory_order_acquire);
-      if(!seg) 
+      if(!seg)
       {
 	extend_(iSeg,NULL,0,false,NULL);
-	seg = _extends[iSeg].load(std::memory_order_acquire); 
-	_extends[iSeg].store(seg,std::memory_order_release);	
+	seg = _extends[iSeg].load(std::memory_order_acquire);
+	_extends[iSeg].store(seg,std::memory_order_release);
       }
 
       UtMutexUnlock(&_lockExtend);
@@ -279,7 +291,7 @@ void *BlockPool::allocBlock( int bid )
 
     UT_ASSERT0( seg != nullptr );
     size_t offs = _blockSize * iBlockInSeg + _szChunkPad;
-    UT_ASSERT2( offs + _blockSize - 1 <  _blockSize*_nBlocksExtend + _szChunkPad );    
+    UT_ASSERT2( offs + _blockSize - 1 <  _blockSize*_nBlocksExtend + _szChunkPad );
     block = BYTE_OFFSET( seg, offs );
   }
 
@@ -359,7 +371,7 @@ void BlockPool::freeBlock_( void *block, int bid )
   #if 0
   TRC3(("BlockPool '%s', %p free block %d -> %p\n", _name,this,bid,block));
   UT_ASSERT_NR((uint64_t)block==ALIGN((uint64_t)block,CPU_CACHELINE_SZ));
-  if(block) 
+  if(block)
   {
     invalidateEyecatcher((Block<uint8_t>*)block);
     block = BYTE_OFFSET(block,sizeof(SLIST_ENTRY));
@@ -381,7 +393,7 @@ BlockPool *BlockPool::create( const char *name,
     			      int nBlocksInitial,
 			      int maxSizeMB,
 			      unsigned options
-			       )  
+			       )
 {
   int rcThis=0;
   BlockPool *p=NULL;
@@ -400,7 +412,7 @@ BlockPool *BlockPool::create( const char *name,
   bool isProtectable = options & OPT_PROTECTABLE;
 
   UT_ASSERT0( offsetof(Block<float>,uheader)==16 );
-  UT_ASSERT0( ALIGN(offsetof(Block<float>,_data),CPU_SIMD_WIDTH) == 
+  UT_ASSERT0( ALIGN(offsetof(Block<float>,_data),CPU_SIMD_WIDTH) ==
       	      offsetof(Block<float>,_data) );
 
   UT_ASSERT0(strlen(name)<ARRAY_LENGTH(_name)-1);
@@ -409,16 +421,16 @@ BlockPool *BlockPool::create( const char *name,
 
   if(isProtectable)
   {
-    blockAlign = ALIGN( blockAlign, MM_SYSTEM_PAGE_SIZE );    
+    blockAlign = ALIGN( blockAlign, MM_SYSTEM_PAGE_SIZE );
   }
 
   UT_ASSERT(CPU_CACHELINE_SZ>=MEMORY_ALLOCATION_ALIGNMENT);
   UT_ASSERT(blockAlign>=16);
 
 
-  // This is not intended for very small blocks 
-  UT_ASSERT(blockSize>=CPU_CACHELINE_SZ);  
-  // Align 
+  // This is not intended for very small blocks
+  UT_ASSERT(blockSize>=CPU_CACHELINE_SZ);
+  // Align
   blockSize = ALIGN(blockSize,blockAlign);
 
   // Allocate memory for object adm (zero initialized)
@@ -428,7 +440,7 @@ BlockPool *BlockPool::create( const char *name,
     ALLOCMEM_ALIGNED2_(p, BlockPool, sizeof(*p), CPU_CACHELINE_SZ,1,
       		     MM_Str2UserId(chbuf,chbuf2));
   }
-  if(!p) 
+  if(!p)
   {
     TRCERRR(("BlockPool::create() '%s' out of memory\n",name),MI_ENOMEM);
   }
@@ -449,24 +461,24 @@ BlockPool *BlockPool::create( const char *name,
   #endif
 
 
-  UT_ASSERT_FATAL(p);   // must be able to call destructor now 
+  UT_ASSERT_FATAL(p);   // must be able to call destructor now
 
   // Initialize members
   strcpy(p->_name,name);
-  
+
   p->_isProtectable = isProtectable;
   p->_blockAlign = blockAlign;
   p->_blockSize = blockSize;
   p->_nBlocksMax = nBlocksMax;
   p->_maxTotalSize = maxSizeMB*(size_t)ONE_MB;
-  
+
   #ifndef BLOCKPOOL_FAST_MONOTONIC
   InitializeSListHead( &p->_freelist );
   #else
   p->_freelist = {};
   #endif
-  
-  UT_ASSERT((uint64_t)&p->_freelist == 
+
+  UT_ASSERT((uint64_t)&p->_freelist ==
       ALIGN((uint64_t)&p->_freelist, CPU_CACHELINE_SZ));
 
   UtMutexInit(&p->_lockExtend);
@@ -492,7 +504,7 @@ BlockPool *BlockPool::create( const char *name,
   else
   {
     // Use constant byte size for all block pool extends to prevent global heap fragmentation
-    size_t extendSize_MB = 64;    
+    size_t extendSize_MB = 64;
     p->_nBlocksExtend = ((extendSize_MB*(size_t)ONE_MB)/(size_t)p->_blockSize);
   }
 
@@ -500,8 +512,8 @@ BlockPool *BlockPool::create( const char *name,
   { // avoid too much overhead for coarse grids (small blocks)
     p->_nBlocksExtend = MIN( p->_nBlocksExtend, 16384 );
   }
-  
-  #ifdef BLOCKPOOL_FAST_MONOTONIC 
+
+  #ifdef BLOCKPOOL_FAST_MONOTONIC
   {
     // Round to (upper) power of 2
     uint32_t n = p->_nBlocksExtend,
@@ -534,8 +546,8 @@ void BlockPool::destroy( BlockPool** p_, int disclaimMem )
 {
   BlockPool *p=p_?*p_:NULL;
   if(p)
-  {    
-   
+  {
+
     int nExtends = p->getMaxActExtensions();
     UT_ASSERT0(nExtends>=0&& nExtends<=ARRAY_LENGTH(p->_extends));
 
@@ -547,7 +559,7 @@ void BlockPool::destroy( BlockPool** p_, int disclaimMem )
 	size_t szTotalAllocated = nExtends * p->_extendsInfo[0].extendSize,
 	       szUsed = nBlocks * p->_blockSize;
         TRC1(("BlockPool::destroy '%s' eff. mem usage was %.2f%% (waste=%.2f MB)\n",
-	      p->_name, 
+	      p->_name,
 	      (szUsed/(double)szTotalAllocated)*100.,
 	      (szTotalAllocated-szUsed)/((double)ONE_MB)));
       }
@@ -567,11 +579,11 @@ void BlockPool::destroy( BlockPool** p_, int disclaimMem )
 
       #ifdef UT_ASSERT_LEVEL_2
       // Invalidate all eyecatchers
-      void *chunkOfBlocks = BYTE_OFFSET(p->_extends[i],p->_szChunkPad);	
+      void *chunkOfBlocks = BYTE_OFFSET(p->_extends[i],p->_szChunkPad);
       int nBlocks = p->_extendsInfo[i].extendNumBlocks;
       for(int i=0;i<nBlocks;i++)
       {
-	Block<uint8_t> *block = 
+	Block<uint8_t> *block =
 	  (Block<uint8_t>*)BYTE_OFFSET(chunkOfBlocks,i*p->_blockSize);
 	p->invalidateEyecatcher(block);
       }
@@ -596,4 +608,3 @@ void BlockPool::destroy( BlockPool** p_, int disclaimMem )
     FREEMEM_ALIGNED(p);
   }
 }
-

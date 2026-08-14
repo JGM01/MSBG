@@ -9,8 +9,8 @@
 
 /*=========================================================================
  *
- *  Block Pools for lightweight / low contention fixed size 
- *  memory management	
+ *  Block Pools for lightweight / low contention fixed size
+ *  memory management
  *
  * =======================================================================*/
 
@@ -31,23 +31,25 @@
 class BlockPool
 {
   public:
-  
-  // Create 
-  static 
-  BlockPool *create( 
+
+  void reset();
+
+  // Create
+  static
+  BlockPool *create(
 	// Name tag for monitoring/tracing convenience
         const char *name,
         // Block size in bytes (32 bit)
-      	int blockSizeBytes,  
+      	int blockSizeBytes,
 	// Max. number of virtual blocks
-	int nBlocksMax,  
+	int nBlocksMax,
 	// Initially allocated  number of blocks
-	int nBlocksInitial,  
+	int nBlocksInitial,
 	// Maximum size in MB to which the pool is allowed to grow (0=unlimited)
 	int maxSizeMB,
 	// Options (OPT_PROTECTABLE)
 	unsigned options=0
-	);    
+	);
 
   enum
   {
@@ -55,7 +57,7 @@ class BlockPool
     OPT_FIXED_EXTEND = (1<<1)
   };
 
-  // Destroy 
+  // Destroy
   static void destroy(BlockPool** bp, int disclaimMem=0);
 
   // Extend by allocating a new large chunk of blocks
@@ -80,9 +82,9 @@ class BlockPool
   {
     return (getNumBlocksAllocated() >> _bp_blocks_per_seg_log2) + 1;
   }
-      
-  size_t getBlockSize(void) const { return _blockSize; }  
-  
+
+  size_t getBlockSize(void) const { return _blockSize; }
+
   size_t getMemUsage(void) const { return _totalSize; }
 
   size_t getBlocksAvailable(void) const { return _nBlocksTotal; }
@@ -90,8 +92,8 @@ class BlockPool
   int isOutOfMem(void) const { return _outOfTotalMem; }
 
   template<typename Data_T>
-  static int offsetToBlockData( ) 
-  { 
+  static int offsetToBlockData( )
+  {
     return offsetof( Block<Data_T>, _data );
   }
 
@@ -100,17 +102,17 @@ class BlockPool
     BLOCK_EYECATCHER = 0x0123
   };
 
-  template<typename Data_T> 
+  template<typename Data_T>
   struct Block
   {
-    // reserve space for list node 
+    // reserve space for list node
     // (e.g. Win32 SLIST_ENTRY for lockfree stack
-    // (Maybe not necessary because it's superimposed 
+    // (Maybe not necessary because it's superimposed
     // over unused blocks only ))
     //
     SLIST_ENTRY zeropad1;  // for zero padding (SIMD access accross block boundaries)
 
-    // Header valid for used blocks only (superimposed with free list node)  
+    // Header valid for used blocks only (superimposed with free list node)
     struct
     {
       uint16_t eyecatcher;
@@ -123,7 +125,7 @@ class BlockPool
     static_assert( sizeof( uheader ) == 16, "" );
     static_assert( sizeof( uheader) == sizeof(SLIST_ENTRY), "");
 
-    // 
+    //
     // Voxel Data
     //
     uint8_t zeropad2[8];  // safe SIMD stencil access of one beyond block border
@@ -141,11 +143,11 @@ class BlockPool
       int len;
 
       p= (char*)&block->zeropad1; len = sizeof(block->zeropad1);
-      for(int i=0;i<len;i++) chbuf1[i] = isprint(p[i]) ? p[i] : '.'; 
+      for(int i=0;i<len;i++) chbuf1[i] = isprint(p[i]) ? p[i] : '.';
       chbuf1[len] = 0;
 
       p= (char*)&block->uheader; len = sizeof(block->uheader);
-      for(int i=0;i<len;i++) chbuf2[i] = isprint(p[i]) ? p[i] : '.'; 
+      for(int i=0;i<len;i++) chbuf2[i] = isprint(p[i]) ? p[i] : '.';
       chbuf2[len] = 0;
 
       TRCERR(("%s: invalid block eyecatcher: '%s' '%s' \n",UT_FUNCNAME,chbuf1,chbuf2));
@@ -164,7 +166,7 @@ class BlockPool
   }
 
   char	    _name[80];
-   
+
   size_t  _blockAlign,
           _blockSize,
 	  _totalSize,
@@ -177,7 +179,7 @@ class BlockPool
 	  _isProtectable;
 
   static const int MAX_EXTENDS=BLOCKPOOL_MAX_EXTENDS;
-  
+
   #ifdef BLOCKPOOL_FAST_MONOTONIC
   std::atomic<int32_t> _bp_next_free;
   std::atomic<void*> _extends[MAX_EXTENDS];
@@ -199,7 +201,7 @@ class BlockPool
 
   size_t _szChunkPad;
 
-  SLIST_HEADER _freelist 
+  SLIST_HEADER _freelist
     	       __attribute__((aligned(SBG_BLOCK_ALIGN)));
 
   UtMutex  _lockExtend;
@@ -207,4 +209,3 @@ class BlockPool
 };
 
 #endif // BLOCKPOOL_H
-
