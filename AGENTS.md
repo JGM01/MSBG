@@ -85,6 +85,17 @@ and compares hashes.
 ./build/difftest
 ```
 
+### 4.2 Interpolation difftest (`interptest.cpp`)
+
+`interptest.cpp` fills a `SBG::SparseGrid<float>` with a quadratic field and
+prints sampled value/gradient/Hessian per position. The Rust side
+(`msbg-rs/tests/difftest_interp.rs`) compares within 1e-4 tolerance.
+
+```bash
+./build_interptest.sh
+./build/interptest
+```
+
 ## 5. Running the benchmark
 
 Two sizes are supported via `MSBG_BENCH_SCALE` (default = full):
@@ -106,13 +117,17 @@ needed.)
 - **A `bench_hot_path_scaling`** — single-thread `BlockPool::allocBlock`/`reset`
   throughput (real `BlockPool`, monotonic `BLOCKPOOL_FAST_MONOTONIC` path).
 - **B `bench_multithreaded_contention`** — parallel `allocBlock` contention
-  (uses `blocks_per_seg = 4096`; note the Rust side uses 256 → not apples-to-apples).
+  (uses `blocks_per_seg = 4096`, matching the Rust bench).
 - **C `bench_cold_extension`** — cold pool create/expand/destroy (page faults).
 - **D `bench_halo_gather`** — the **real** `HaloBlockSet::fillHaloBlock_<float>`
   (18³ halo gather over an active-block shell).
 - **E `bench_laplacian_smoothing_e2e`** — the **real**
   `MultiresSparseGrid::applyChannelPdeFast<float>` for `laplTyp = 1` (regular
   Laplacian smoothing) and `laplTyp = 4` (`PDE_MEAN_CURVATURE`).
+- **G `bench_interpolation`** — field-sampling throughput over a `SparseGrid<float>`
+  (linear value, linear value+gradient, cubic value+gradient, cubic Hessian).
+  Run it with `./build/bench_executable interp`; the Rust mirror is
+  `../msbg-rs/benches/interp_bench.rs`.
 
 The active block set is a spherical shell (same formula as the Rust side) at
 ~14 % occupancy. See `generate_active_blocks()` / `build_grid()`.

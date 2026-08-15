@@ -287,6 +287,165 @@ void bench_laplacian_smoothing_e2e() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Scenario F: Density quantization (REAL renderDens* SIMD)
+// ---------------------------------------------------------------------------
+
+void bench_density_quantization() {
+    std::cout << "\n--- Scenario F: Density Quantization Throughput (real renderDens* SIMD) ---\n";
+
+    const size_t large = 4ull * 1024 * 1024;
+
+    for (size_t n : { (size_t)N, large }) {
+        // dequant: u16 -> f32
+        std::vector<uint16_t> src(n);
+        for (size_t i = 0; i < n; i++) src[i] = (uint16_t)((i * 26543 + 1) & 0xFFFF);
+        std::vector<float> dst(n, 0.0f);
+
+        size_t iters = (n >= large) ? 8 : 2000;
+        auto start = std::chrono::high_resolution_clock::now();
+        for (size_t r = 0; r < iters; r++) {
+            for (size_t i = 0; i < n; i += 8) {
+                Vec8f v = renderDensToFloat_simd8<uint16_t>(&src[i]);
+                v.store(&dst[i]);
+            }
+        }
+        auto end = std::chrono::high_resolution_clock::now();
+        black_box(dst[0]);
+        black_box(dst[n - 1]);
+        std::chrono::duration<double, std::milli> duration = end - start;
+        double gvox = (double)(n * iters) / (duration.count() / 1000.0) / 1e9;
+        std::cout << "[C++] density_dequant_" << n << " avg: "
+                  << (duration.count() / iters) << " ms (" << gvox << " Gvoxels/s)\n";
+
+        // quantize: f32 -> u16
+        std::vector<float> fsrc(n);
+        for (size_t i = 0; i < n; i++) fsrc[i] = (float)(i % 1000) / 999.0f;
+        std::vector<uint16_t> qdst(n, 0);
+
+        start = std::chrono::high_resolution_clock::now();
+        for (size_t r = 0; r < iters; r++) {
+            for (size_t i = 0; i < n; i += 8) {
+                Vec8f vf;
+                vf.load(&fsrc[i]);
+                renderDensFromFloat_storeSimd8<uint16_t>(vf, &qdst[i]);
+            }
+        }
+        end = std::chrono::high_resolution_clock::now();
+        black_box(qdst[0]);
+        black_box(qdst[n - 1]);
+        duration = end - start;
+        gvox = (double)(n * iters) / (duration.count() / 1000.0) / 1e9;
+        std::cout << "[C++] density_quantize_" << n << " avg: "
+                  << (duration.count() / iters) << " ms (" << gvox << " Gvoxels/s)\n";
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Scenario G: Field sampling (REAL interpolate* kernels)
+// ---------------------------------------------------------------------------
+
+static float bench_field(float x, float y, float z) {
+    return 0.002f * x * x + 0.003f * y * y + 0.004f * z * z
+         + 0.005f * x * y + 0.006f * x * z + 0.007f * y * z
+         + 0.1f * x + 0.05f * y - 0.02f * z + 0.75f;
+}
+
+static double now_ms() {
+    return std::chrono::duration<double, std::milli>(
+               std::chrono::high_resolution_clock::now().time_since_epoch())
+        .count();
+}
+
+static void report_gsamples(const char *name, long long samples, double ms) {
+    double gs = (double)samples / (ms / 1000.0) / 1e9;
+    std::cout << "[C++] " << name << ": " << gs << " Gsamples/s\n";
+}
+
+void bench_interpolation() {
+    std::cout << "\n--- Scenario G: Field Sampling (real interpolate*) ---\n";
+
+    const int sx = 96, sy = 96, sz = 96, bsx = 16;
+    SparseGrid<float> *sg =
+        SparseGrid<float>::create("interp", sx, sy, sz, bsx, 0, -1, OPT_NO_BORDPAD);
+    sg->prepareDataAccess();
+    sg->setEmptyValue(0.0f);
+    sg->setFullValue(1.0f);
+
+    for (int z = 0; z < sz; z++)
+        for (int y = 0; y < sy; y++)
+            for (int x = 0; x < sx; x++)
+                sg->setValue(x, y, z, bench_field((float)x, (float)y, (float)z));
+
+    const int NS = 100000;
+    uint32_t seed = 12345;
+    auto rng = [&seed]() -> float {
+        seed = seed * 1664525u + 1013904223u;
+        return (float)seed / (float)UINT32_MAX;
+    };
+    std::vector<Vec4f> pos(NS);
+    for (int i = 0; i < NS; i++)
+        pos[i] = Vec4f(2.0f + rng() * 92.0f, 2.0f + rng() * 92.0f, 2.0f + rng() * 92.0f, 0.0f);
+
+    // linear value
+    {
+        float acc = 0;
+        int iters = 50;
+        double t0 = now_ms();
+        for (int r = 0; r < iters; r++)
+            for (int i = 0; i < NS; i++) acc += sg->interpolateFloatFast(pos[i], OPT_IPCORNER);
+        black_box(acc);
+        report_gsamples("linear_value", (long long)NS * iters, now_ms() - t0);
+    }
+
+    // linear value + gradient
+    {
+        float acc = 0;
+        int iters = 50;
+        double t0 = now_ms();
+        for (int r = 0; r < iters; r++)
+            for (int i = 0; i < NS; i++) {
+                float v, g[3];
+                sg->interpolateLinearWithGradient<1, 1>(pos[i], OPT_IPCORNER, &v, g);
+                acc += v + g[0] + g[1] + g[2];
+            }
+        black_box(acc);
+        report_gsamples("linear_grad", (long long)NS * iters, now_ms() - t0);
+    }
+
+    // cubic value + gradient
+    {
+        float acc = 0;
+        int iters = 20;
+        double t0 = now_ms();
+        for (int r = 0; r < iters; r++)
+            for (int i = 0; i < NS; i++) {
+                float v, g[4];
+                Vec4f cg;
+                sg->interpolateWithDerivs<0>(IP_BSPLINE_CUBIC, pos[i], 0, &v, &cg);
+                cg.store(g);
+                acc += v + g[0] + g[1] + g[2];
+            }
+        black_box(acc);
+        report_gsamples("cubic_grad", (long long)NS * iters, now_ms() - t0);
+    }
+
+    // cubic value + gradient + Hessian
+    {
+        float acc = 0;
+        int iters = 10;
+        double t0 = now_ms();
+        for (int r = 0; r < iters; r++)
+            for (int i = 0; i < NS; i++) {
+                float v, g[3], h[6];
+                sg->interpolateWithSecondDerivs<0>(pos[i], 0, &v, g, h);
+                acc += v + h[0] + h[1] + h[2] + h[3] + h[4] + h[5];
+            }
+        black_box(acc);
+        report_gsamples("cubic_hess", (long long)NS * iters, now_ms() - t0);
+    }
+}
+
 int main(int argc, char **argv) {
     std::string scenario;
     for (int i = 1; i < argc; i++) {
@@ -311,10 +470,11 @@ int main(int argc, char **argv) {
 
     bool all = scenario.empty();
     bool known = scenario == "hot" || scenario == "contention" ||
-                 scenario == "cold" || scenario == "halo" || scenario == "laplacian";
+                 scenario == "cold" || scenario == "halo" || scenario == "laplacian" ||
+                 scenario == "density" || scenario == "interp";
     if (!all && !known) {
         std::cerr << "unknown scenario '" << scenario
-                  << "' (use: hot contention cold halo laplacian)\n";
+                  << "' (use: hot contention cold halo laplacian density interp)\n";
         return 1;
     }
 
@@ -325,6 +485,8 @@ int main(int argc, char **argv) {
     if (all || scenario == "cold")       bench_cold_extension();
     if (all || scenario == "halo")       bench_halo_gather();
     if (all || scenario == "laplacian")  bench_laplacian_smoothing_e2e();
+    if (all || scenario == "density")    bench_density_quantization();
+    if (all || scenario == "interp")     bench_interpolation();
 
     return 0;
 }

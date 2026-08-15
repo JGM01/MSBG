@@ -102,6 +102,7 @@ Scenario-name mapping (same algorithm on both sides):
 | `cold` | `blockpool_cold_alloc` |
 | `halo` | `halo_gather` |
 | `laplacian` | `laplacian_smoothing_e2e` |
+| `density` | `density_dequant` / `density_quantize` (`cargo bench --bench density_bench`) |
 
 Rust-only benches with no C++ counterpart: `laplacian_compute_only`, `voxel_access`.
 
