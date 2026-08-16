@@ -5,6 +5,7 @@
 #include <cstring>
 #include <cstdint>
 #include <cstdlib>
+#include <algorithm>
 #include <omp.h>
 
 #include "src/globdef.h"
@@ -277,16 +278,19 @@ void bench_laplacian_smoothing_e2e() {
         for (int laplTyp : {1, 4}) {
             const char *name = laplTyp == 1 ? "laplacian" : "mean_curvature";
             int numIter = (target >= 50000) ? 10 : 20;
+            // The demo's live path: 8-color in-place (negative laplTyp + the
+            // 8-color flag). Matches the Rust `Sweeper` (8-color in-place).
+            int laplTypColor = -(laplTyp + OPT_8_COLOR_SCHEME);
 
             // Warmup
             msg->applyChannelPdeFast<float>(
-                CH_FLOAT_1, CH_FLOAT_2, CH_FLOAT_3, &active, laplTyp,
+                CH_FLOAT_1, CH_FLOAT_2, CH_FLOAT_3, &active, laplTypColor,
                 0, 0.0f, 0.0f, 0.0f, numIter, 1.0f, 0.025f,
                 0.0f, NULL, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0, NULL, 0);
 
             auto start = std::chrono::high_resolution_clock::now();
             msg->applyChannelPdeFast<float>(
-                CH_FLOAT_1, CH_FLOAT_2, CH_FLOAT_3, &active, laplTyp,
+                CH_FLOAT_1, CH_FLOAT_2, CH_FLOAT_3, &active, laplTypColor,
                 0, 0.0f, 0.0f, 0.0f, numIter, 1.0f, 0.025f,
                 0.0f, NULL, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0, NULL, 0);
             auto end = std::chrono::high_resolution_clock::now();
@@ -464,6 +468,128 @@ void bench_interpolation() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Scenario H: Multires (refinement-map setup + coarse-neighbor halo gather)
+// ---------------------------------------------------------------------------
+
+static MultiresSparseGrid *build_multires_grid(int active_target, std::vector<int> &active) {
+    int bpd = (int)std::ceil(std::cbrt(active_target / SHELL_OCCUPANCY));
+    bpd = std::max(bpd, 8);
+    int sx = bpd * BSX, sy = bpd * BSX, sz = bpd * BSX;
+
+    MultiresSparseGrid *msg = MultiresSparseGrid::create(
+        "bench", sx, sy, sz, BSX, -1, 0, -1, 0); // 3 levels, full channel set
+
+    SparseGrid<float> *sg0 = msg->getFloatChannel(CH_FLOAT_1, 0);
+    std::vector<int> shell = generate_active_blocks(sg0->nbx(), sg0->nby(), sg0->nbz());
+
+    std::vector<int> blockLevels(msg->nBlocks(), msg->getNumLevels() - 1);
+    for (int bid : shell) blockLevels[bid] = 0;
+    msg->regularizeRefinementMap(blockLevels.data());
+    msg->setRefinementMap(blockLevels.data(), NULL, 0, NULL, false, false);
+
+    active.clear();
+    for (int bid = 0; bid < msg->nBlocks(); bid++) {
+        if (msg->getBlockInfo(bid)->level == 0) active.push_back(bid);
+    }
+
+    SparseGrid<float> *sg1 = msg->getFloatChannel(CH_FLOAT_1, 1);
+    sg0->prepareDataAccess();
+    sg1->prepareDataAccess();
+    sg0->setEmptyValue(0.0f);
+    sg0->setFullValue(1.0f);
+    sg1->setEmptyValue(0.0f);
+    sg1->setFullValue(1.0f);
+    int nvox0 = sg0->nVoxelsInBlock(), nvox1 = sg1->nVoxelsInBlock();
+    for (int bid : active) {
+        float *d = sg0->getBlockDataPtr(bid, 1, 0);
+        for (int i = 0; i < nvox0; i++) d[i] = 0.5f;
+    }
+    for (int bid = 0; bid < msg->nBlocks(); bid++) {
+        if (msg->getBlockInfo(bid)->level == 1) {
+            float *d = sg1->getBlockDataPtr(bid, 1, 0);
+            for (int i = 0; i < nvox1; i++) d[i] = 0.5f;
+        }
+    }
+    return msg;
+}
+
+void bench_set_refinement_map() {
+    std::cout << "\n--- Scenario H1: setRefinementMap (regularize + set, topology) ---\n";
+    std::vector<int> targs = gSmall ? std::vector<int>{500, 2000, 5000}
+                                    : std::vector<int>{5000, 20000, 50000};
+    for (int target : targs) {
+        int bpd = std::max(8, (int)std::ceil(std::cbrt(target / SHELL_OCCUPANCY)));
+        int sx = bpd * BSX, sy = bpd * BSX, sz = bpd * BSX;
+        MultiresSparseGrid *msg = MultiresSparseGrid::create("bench", sx, sy, sz, BSX, -1, 0, -1, 0);
+        SparseGrid<float> *sg0 = msg->getFloatChannel(CH_FLOAT_1, 0);
+        std::vector<int> shell = generate_active_blocks(sg0->nbx(), sg0->nby(), sg0->nbz());
+        std::vector<int> blockLevels(msg->nBlocks(), msg->getNumLevels() - 1);
+        for (int bid : shell) blockLevels[bid] = 0;
+        std::vector<int> seed = blockLevels;
+
+        int iters = 20;
+        msg->regularizeRefinementMap(blockLevels.data());
+        msg->setRefinementMap(blockLevels.data(), NULL, 0, NULL, false, false);
+
+        auto start = std::chrono::high_resolution_clock::now();
+        for (int r = 0; r < iters; r++) {
+            std::copy(seed.begin(), seed.end(), blockLevels.begin());
+            msg->regularizeRefinementMap(blockLevels.data());
+            msg->setRefinementMap(blockLevels.data(), NULL, 0, NULL, false, false);
+        }
+        auto end = std::chrono::high_resolution_clock::now();
+        std::chrono::duration<double, std::milli> duration = end - start;
+        double avg_ms = duration.count() / iters;
+
+        double mblocks_per_sec = (msg->nBlocks() / (avg_ms / 1000.0)) / 1e6;
+        std::cout << "[C++] set_refinement_map_" << target << " blocks=" << msg->nBlocks()
+                  << " avg: " << avg_ms << " ms (" << mblocks_per_sec << " Mblocks/s)\n";
+        MultiresSparseGrid::destroy(msg);
+    }
+}
+
+void bench_multires_halo() {
+    std::cout << "\n--- Scenario H2: Multires halo gather (fillHaloBlock_ + OPT_BC_COARSE_LEVEL) ---\n";
+    std::vector<int> targs = gSmall ? std::vector<int>{500, 2000, 5000}
+                                    : std::vector<int>{5000, 20000, 50000};
+    for (int target : targs) {
+        std::vector<int> active;
+        MultiresSparseGrid *msg = build_multires_grid(target, active);
+        int nThreads = omp_get_max_threads();
+
+        HaloBlockSet haloBlocks(msg, 1, nThreads);
+        int iters = 30;
+
+        #pragma omp parallel for schedule(static)
+        for (int i = 0; i < (int)active.size(); i++) {
+            int tid = omp_get_thread_num();
+            float **hb = haloBlocks.fillHaloBlock_<float>(CH_FLOAT_1, active[i], 0, tid, OPT_BC_COARSE_LEVEL);
+            black_box(hb);
+        }
+
+        auto start = std::chrono::high_resolution_clock::now();
+        for (int run = 0; run < iters; run++) {
+            #pragma omp parallel for schedule(static)
+            for (int i = 0; i < (int)active.size(); i++) {
+                int tid = omp_get_thread_num();
+                float **hb = haloBlocks.fillHaloBlock_<float>(CH_FLOAT_1, active[i], 0, tid, OPT_BC_COARSE_LEVEL);
+                black_box(hb);
+            }
+        }
+        auto end = std::chrono::high_resolution_clock::now();
+        std::chrono::duration<double, std::milli> duration = end - start;
+        double avg_ms = duration.count() / iters;
+        double active_voxels = (double)active.size() * N;
+        double gvoxels_per_sec = (active_voxels / (avg_ms / 1000.0)) / 1e9;
+
+        std::cout << "[C++] multires_halo_" << target << " active=" << active.size()
+                  << " avg: " << avg_ms << " ms (" << gvoxels_per_sec << " Gvoxels/s)\n";
+
+        MultiresSparseGrid::destroy(msg);
+    }
+}
+
 int main(int argc, char **argv) {
     std::string scenario;
     for (int i = 1; i < argc; i++) {
@@ -489,10 +615,10 @@ int main(int argc, char **argv) {
     bool all = scenario.empty();
     bool known = scenario == "hot" || scenario == "contention" ||
                  scenario == "cold" || scenario == "halo" || scenario == "laplacian" ||
-                 scenario == "density" || scenario == "interp";
+                 scenario == "density" || scenario == "interp" || scenario == "multires";
     if (!all && !known) {
         std::cerr << "unknown scenario '" << scenario
-                  << "' (use: hot contention cold halo laplacian density interp)\n";
+                  << "' (use: hot contention cold halo laplacian density interp multires)\n";
         return 1;
     }
 
@@ -505,6 +631,7 @@ int main(int argc, char **argv) {
     if (all || scenario == "laplacian")  bench_laplacian_smoothing_e2e();
     if (all || scenario == "density")    bench_density_quantization();
     if (all || scenario == "interp")     bench_interpolation();
+    if (all || scenario == "multires")   { bench_set_refinement_map(); bench_multires_halo(); }
 
     return 0;
 }
