@@ -238,7 +238,25 @@ void bench_halo_gather() {
         double active_voxels = (double)active.size() * N;
         double gvoxels_per_sec = (active_voxels / (avg_ms / 1000.0)) / 1e9;
 
-        std::cout << "[C++] shell_fill_" << target << " active=" << active.size()
+        std::cout << "[C++] shell_fill_full_" << target << " active=" << active.size()
+                  << " avg time: " << avg_ms << " ms (" << gvoxels_per_sec << " Gvoxels/s)\n";
+
+        // Faces-only (do1stOrderOnly=1): used by the 7-point Laplacian.
+        start = std::chrono::high_resolution_clock::now();
+        for (int run = 0; run < iters; run++) {
+            #pragma omp parallel for schedule(static)
+            for (int i = 0; i < (int)active.size(); i++) {
+                int tid = omp_get_thread_num();
+                float **hb = haloBlocks.fillHaloBlock_<float, 1, 1>(CH_FLOAT_1, active[i], 0, tid, OPT_BC_NEUMANN);
+                black_box(hb);
+            }
+        }
+        end = std::chrono::high_resolution_clock::now();
+        duration = end - start;
+        avg_ms = duration.count() / iters;
+        gvoxels_per_sec = (active_voxels / (avg_ms / 1000.0)) / 1e9;
+
+        std::cout << "[C++] shell_fill_faces_" << target << " active=" << active.size()
                   << " avg time: " << avg_ms << " ms (" << gvoxels_per_sec << " Gvoxels/s)\n";
 
         MultiresSparseGrid::destroy(msg);
