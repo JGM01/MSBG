@@ -6,6 +6,10 @@
 #include <cstdint>
 #include <cstdlib>
 #include <algorithm>
+#include <fstream>
+#include <sstream>
+#include <string>
+#include <tuple>
 #include <omp.h>
 
 #include "src/globdef.h"
@@ -590,6 +594,262 @@ void bench_multires_halo() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Scenario H: Surface reconstruction pipeline (REAL msbg_test_sparse phases)
+// ---------------------------------------------------------------------------
+
+typedef uint32_t ParticleIdx;
+typedef struct { Vec3Float pos; ParticleIdx idxNext; } Particle;
+static Particle *sPart = NULL;
+static uint64_t sNMaxParticles = 0;
+inline static ParticleIdx spIdx(int nInst, int iInst, int i) { return nInst * (ParticleIdx)iInst + (ParticleIdx)i + 1; }
+inline static Particle *spGet(ParticleIdx ixp) { return &sPart[ixp]; }
+inline static void spPush(Particle *p, ParticleIdx idx, ParticleIdx *root) {
+  ParticleIdx old = InterlockedExchange((LONG volatile *)root, idx);
+  p->idxNext = old;
+}
+
+static std::tuple<std::vector<Vec3Float>*, Vec3Float, Vec3Float>
+spReadPLY(const char *filename) {
+  std::ifstream file(filename);
+  std::string line;
+  std::vector<Vec3Float>* vertices = new std::vector<Vec3Float>();
+  Vec3Float bbMin(1e20), bbMax(-1e20);
+  bool parsingHeader = true;
+  int vertexCount = 0, verticesParsed = 0;
+  while (std::getline(file, line)) {
+    std::istringstream iss(line);
+    if (parsingHeader) {
+      if (line.rfind("element ve", 0) == 0) { iss >> line >> line >> vertexCount; }
+      else if (line == "end_header") parsingHeader = false;
+    } else {
+      if (verticesParsed < vertexCount) {
+        Vec3Float vertex;
+        iss >> vertex.x >> vertex.y >> vertex.z;
+        vertices->push_back(vertex);
+        for (int k = 0; k < 3; k++) {
+          bbMin[k] = std::min(bbMin[k], vertex[k]);
+          bbMax[k] = std::max(bbMax[k], vertex[k]);
+        }
+        verticesParsed++;
+      }
+    }
+  }
+  return std::make_tuple(vertices, bbMin, bbMax);
+}
+
+// Runs the demo's placement + active-set + 8-color splat + finalize, timing
+// each phase. The smoothing phase is scenario E (applyChannelPdeFast), reused
+// here only for the end-to-end wall clock.
+static void bench_surface() {
+    std::cout << "\n--- Scenario H: Surface Reconstruction (real pipeline) ---\n";
+
+    // small: res2 bunny, 256^3, single instance (matches the difftest).
+    // big:   res2 bunny, 512^3, 64 instances (~523K particles) — the C++
+    //        splat is DRAM-latency bound at scale, so the full bunny-of-bunnies
+    //        (2048+ instances) takes many minutes; keep it runnable.
+    const char *ply = "data/bun_zipper_res2.ply";
+    int sx = gSmall ? 256 : 512, sy = sx, sz = sx;
+    int nInst = gSmall ? 1 : 64;
+    float scaleFactor = gSmall ? 0.25f : 0.01f;
+    const char *envRes = getenv("MSBG_SURFACE_RES");
+    const char *envNInst = getenv("MSBG_SURFACE_NINST");
+    if (envRes) { sx = sy = sz = atoi(envRes); }
+    if (envNInst) { nInst = atoi(envNInst); }
+    const float rParticle = 2.0f, nbDist = 2.0f;
+    const int bsx = 16;
+    const float rScan = rParticle + nbDist;
+
+    double tParse = now_ms();
+    auto [basePoints, bbMin, bbMax] = spReadPLY(ply);
+    double t0 = now_ms();
+    std::cout << "[C++] surface_parse " << basePoints->size() << " verts: "
+              << (t0 - tParse) << " ms ("
+              << (basePoints->size() / (t0 - tParse) * 1000.0 / 1e6) << " Mverts/s)\n";
+    Vec3Float span;
+    float spanMax = -1e20f;
+    for (int k = 0; k < 3; k++) { span[k] = bbMax[k] - bbMin[k]; spanMax = std::max(spanMax, span[k]); }
+    int nBase = (int)basePoints->size();
+    if (nInst == 0) nInst = nBase;
+    uint64_t nTotalParticles = (uint64_t)nInst * (uint64_t)nBase;
+    sNMaxParticles = nTotalParticles;
+
+    MultiresSparseGrid *msbg = MultiresSparseGrid::create(
+        "SURFACEBENCH", sx, sy, sz, bsx, -1, 0, -1,
+        MSBG::OPT_SINGLE_LEVEL | MSBG::OPT_SINGLE_CHANNEL_FLOAT);
+    LONG *blockActive = NULL;
+    ParticleIdx *particlesPerBlock = NULL;
+    ALLOCARR0_(blockActive, LONG, msbg->nBlocks());
+    ALLOCARR0_(particlesPerBlock, ParticleIdx, msbg->nBlocks());
+    int chan = CH_UINT16_1;
+    SparseGrid<uint16_t> *sg0 = msbg->getUint16Channel(chan, 0);
+
+    // --- Placement + active set + per-block lists ---
+    float rScanBsx = rScan / (float)sg0->bsx();
+    int bxMax = sg0->nbx()-1, byMax = sg0->nby()-1, bzMax = sg0->nbz()-1;
+    ALLOCARR_(sPart, Particle, nTotalParticles + 1);
+    uint64_t nAct = 0;
+    {
+      const float scale2DestBlockGrid = 1.0f / (float)sg0->bsx();
+      const float baseScale = 1.0f / spanMax;
+      const float sxyzMax = (float)sg0->sxyzMax(), sxyzMin = (float)sg0->sxyzMin();
+      const float scale = sxyzMin * scaleFactor;
+      using TLS = struct { size_t nActParticles; };
+      ThrRunParallel<TLS>(nInst, nullptr,
+        [&](TLS &tls, int tid, size_t iInst) {
+          Vec4f baseMin(bbMin.x, bbMin.y, bbMin.z, 0);
+          Vec4f pos = sxyzMax * baseScale * (Vec4f((*basePoints)[iInst].x, (*basePoints)[iInst].y, (*basePoints)[iInst].z, 0) - baseMin);
+          Vec4f pos0 = sxyzMax * 0.2f + 0.6f * pos;
+          for (int i = 0; i < nBase; i++) {
+            Vec4f p = baseScale * (Vec4f((*basePoints)[i].x, (*basePoints)[i].y, (*basePoints)[i].z, 0) - baseMin);
+            p = pos0 + scale * p;
+            if (!msbg->isInDomainRange(p)) continue;
+            Vec4i ipos = truncate_to_int(p);
+            if (!sg0->inRange(ipos)) continue;
+            ParticleIdx ixp = spIdx(nInst, iInst, i);
+            Particle *pp = spGet(ixp);
+            pp->pos = Vec3Float(p);
+            Vec4f bpos = p * scale2DestBlockGrid;
+            Vec4i bpos1 = max(truncate_to_int(bpos - rScanBsx), 0),
+                  bpos2 = min(truncate_to_int(bpos + rScanBsx), Vec4i(bxMax, byMax, bzMax, INT32_MAX));
+            for (int bz = vget_z(bpos1); bz <= vget_z(bpos2); bz++)
+              for (int by = vget_y(bpos1); by <= vget_y(bpos2); by++)
+                for (int bx = vget_x(bpos1); bx <= vget_x(bpos2); bx++)
+                  InterlockedIncrement((volatile LONG *)(&blockActive[sg0->getBlockIndex(bx, by, bz)]));
+            int bid = sg0->getBlockIndex(sg0->getBlockCoords(ipos));
+            spPush(pp, ixp, &particlesPerBlock[bid]);
+            tls.nActParticles++;
+          }
+        },
+        [&](TLS &tls, int tid) { nAct += tls.nActParticles; });
+    }
+    double tPlace = now_ms();
+    std::cout << "[C++] surface_place_" << nAct << " particles: " << (tPlace - t0)
+              << " ms (" << (nAct / (tPlace - t0) * 1000.0 / 1e6) << " Mparticles/s)\n";
+
+    // --- Refinement map + allocate active blocks (fill 65535) ---
+    LongInt nActiveBlocks = 0;
+    std::unique_ptr<int[]> blockLevels(new int[msbg->nBlocks()]);
+    for (int i = 0; i < msbg->nBlocks(); i++) {
+      int level = msbg->getNumLevels() - 1;
+      if (blockActive[i]) { level = 0; nActiveBlocks++; }
+      blockLevels[i] = level;
+    }
+    msbg->regularizeRefinementMap(blockLevels.get());
+    msbg->setRefinementMap(blockLevels.get(), NULL, -1, NULL, false);
+    std::vector<int> activeBlocks;
+    sg0->reset();
+    sg0->prepareDataAccess(chan);
+    sg0->setEmptyValue(renderDensFromFloat_<uint16_t>(0.0f));
+    sg0->setFullValue(renderDensFromFloat_<uint16_t>(1.0f));
+    {
+      using TLS = struct { std::vector<int> activeBlocks; };
+      ThrRunParallel<TLS>(sg0->nBlocks(),
+        [&](TLS &tls, int tid) { tls.activeBlocks.reserve(256); },
+        [&](TLS &tls, int tid, int bid) {
+          BlockInfo *bi = msbg->getBlockInfo(bid);
+          FLAG_RESET(bi->flags, BLK_EXISTS);
+          if (bi->level > 0) { sg0->setEmptyBlock(bid); return; }
+          tls.activeBlocks.push_back(bid);
+          FLAG_SET(bi->flags, BLK_EXISTS);
+          uint16_t *data = sg0->getBlockDataPtr(bid, 1, 0);
+          for (int i = 0; i < sg0->nVoxelsInBlock(); i++) data[i] = renderDensFromFloat_<uint16_t>(1.0f);
+        },
+        [&](TLS &tls, int tid) { UT_VECTOR_APPEND(activeBlocks, tls.activeBlocks); },
+        0, /*doSerial=*/true);
+    }
+
+    // --- 8-color lock-free splat ---
+    const float distSqMax = rScan * rScan, distSqMaxInv = 1.0f / distSqMax;
+    std::vector<int> activeBlocksPerCol[8];
+    for (int i = 0; i < (int)activeBlocks.size(); i++) {
+      int bid = activeBlocks[i];
+      Vec4i bpos = sg0->getBlockCoordsById(bid);
+      activeBlocksPerCol[getBlockColor8(vget_x(bpos), vget_y(bpos), vget_z(bpos))].push_back(bid);
+    }
+    uint64_t nWrites = 0;
+    (void)nWrites;
+    for (int icol = 0; icol < 8; icol++) {
+      std::vector<int> *blockList = &activeBlocksPerCol[icol];
+      ThrRunParallel<int>(blockList->size(), nullptr,
+        [&](int &tls, int tid, int ibid) {
+          int bid = (*blockList)[ibid];
+          Particle *p = NULL;
+          for (ParticleIdx ixp = particlesPerBlock[bid]; ixp; ixp = p->idxNext) {
+            p = spGet(ixp);
+            Vec4f pos0(p->pos[0], p->pos[1], p->pos[2], 0.f);
+            Vec4i ipos1 = max(truncate_to_int(ceil(pos0 - rScan - 0.5f)), 0),
+                  ipos2 = min(truncate_to_int(floor(pos0 + rScan - 0.5f)), sg0->v4iDomMax());
+            int ix1 = vget_x(ipos1), ix2 = vget_x(ipos2),
+                iy1 = vget_y(ipos1), iy2 = vget_y(ipos2),
+                iz1 = vget_z(ipos1), iz2 = vget_z(ipos2);
+            Vec4f pshift = pos0 - 0.5f;
+            float x0 = vfget_x(pshift), y0 = vfget_y(pshift), z0 = vfget_z(pshift);
+            const int bsxLog2 = sg0->bsxLog2(), bsx2Log2 = sg0->bsx2Log2(),
+                      bsxMask = sg0->bsx() - 1, nx = sg0->nbx(), nxy = sg0->nbxy();
+            for (int iz = iz1; iz <= iz2; iz++) {
+              float dz = iz - z0;
+              int ibz = (iz >> bsxLog2) * nxy, ivz = (iz & bsxMask) << bsx2Log2;
+              for (int iy = iy1; iy <= iy2; iy++) {
+                float dy = iy - y0, distSqZY = dz * dz + dy * dy;
+                int ibzy = ibz + (iy >> bsxLog2) * nx, ivzy = ivz + ((iy & bsxMask) << bsxLog2);
+                for (int ix = ix1; ix <= ix2; ix++) {
+                  float dx = ix - x0, distSq = distSqZY + dx * dx;
+                  if (distSq > distSqMax) continue;
+                  int ib = ibzy + (ix >> bsxLog2), iv = ivzy + (ix & bsxMask);
+                  SBG::Block<uint16_t> *block = sg0->getBlock(ib);
+                  if (!sg0->isValueBlock(block)) continue;
+                  uint16_t val = renderDensFromFloat_<uint16_t>(distSq * distSqMaxInv);
+                  block->_data[iv] = std::min(block->_data[iv], val);
+                }
+              }
+            }
+          }
+        });
+    }
+    double tSplat = now_ms();
+    std::cout << "[C++] surface_splat active=" << activeBlocks.size()
+              << " particles=" << nAct << ": " << (tSplat - tPlace)
+              << " ms (" << (nAct / (tSplat - tPlace) * 1000.0 / 1e6) << " Mparticles/s)\n";
+
+    // --- Finalize ---
+    ThrRunParallel<int>(activeBlocks.size(), nullptr,
+      [&](int &tls, int tid, int ibid) {
+        int bid = activeBlocks[ibid];
+        uint16_t *data = sg0->getBlockDataPtr(bid);
+        for (int vid = 0; vid < sg0->nVoxelsInBlock(); vid++) {
+          float distSq = renderDensToFloat_(data[vid]);
+          uint16_t uiVal = 0;
+          if (distSq < 0.999f) {
+            distSq *= distSqMax;
+            float dist = sqrtf(distSq) - rParticle;
+            float f = 1.0f - MT_LINSTEPF(-rParticle, (rParticle + nbDist), dist);
+            uiVal = renderDensFromFloat_<uint16_t>(f);
+          }
+          data[vid] = uiVal;
+        }
+      });
+    double tFinal = now_ms();
+    std::cout << "[C++] surface_finalize active=" << activeBlocks.size() << ": "
+              << (tFinal - tSplat) << " ms ("
+              << ((double)activeBlocks.size() * 4096 / (tFinal - tSplat) * 1000.0 / 1e9)
+              << " Gvoxels/s)\n";
+
+    // --- e2e wall clock incl. 6 mean-curvature sweeps ---
+    int numIter = 6;
+    msbg->applyChannelPdeFast<uint16_t>(
+        chan, CH_NULL, CH_NULL, &activeBlocks, -(PDE_MEAN_CURVATURE + OPT_8_COLOR_SCHEME),
+        1, 0, 0, 0, numIter, 1.0f, 0.05f, 0, NULL, 0, 0, 0, 0, 0, 0, NULL, 0);
+    double tEnd = now_ms();
+    std::cout << "[C++] surface_e2e (parse+place+splat+finalize+6xMC) "
+              << (tEnd - t0) << " ms\n";
+
+    FREEMEM(particlesPerBlock);
+    FREEMEM(blockActive);
+    FREEMEM(sPart);
+    MultiresSparseGrid::destroy(msbg);
+}
+
 int main(int argc, char **argv) {
     std::string scenario;
     for (int i = 1; i < argc; i++) {
@@ -615,10 +875,11 @@ int main(int argc, char **argv) {
     bool all = scenario.empty();
     bool known = scenario == "hot" || scenario == "contention" ||
                  scenario == "cold" || scenario == "halo" || scenario == "laplacian" ||
-                 scenario == "density" || scenario == "interp" || scenario == "multires";
+                 scenario == "density" || scenario == "interp" || scenario == "multires" ||
+                 scenario == "surface";
     if (!all && !known) {
         std::cerr << "unknown scenario '" << scenario
-                  << "' (use: hot contention cold halo laplacian density interp multires)\n";
+                  << "' (use: hot contention cold halo laplacian density interp multires surface)\n";
         return 1;
     }
 
@@ -632,6 +893,7 @@ int main(int argc, char **argv) {
     if (all || scenario == "density")    bench_density_quantization();
     if (all || scenario == "interp")     bench_interpolation();
     if (all || scenario == "multires")   { bench_set_refinement_map(); bench_multires_halo(); }
+    if (all || scenario == "surface")    bench_surface();
 
     return 0;
 }
